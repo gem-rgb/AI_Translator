@@ -1,0 +1,18 @@
+# Screen capture & OCR
+mss>=9.0.0
+pytesseract>=0.3.10
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Language detection & translation
+langdetect>=1.0.9
+deep-translator>=1.11.0
+
+# UI overlay & system tray
+PyQt5>=5.15.0
+
+# Clipboard monitoring
+pyperclip>=1.8.2
+
+# Hotkey support
+keyboard>=0.13.5
