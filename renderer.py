@@ -223,6 +223,35 @@ def _has_consistent_left_edge(lines):
     return max(left_edges) - min(left_edges) <= max(18, min(line["h"] for line in lines) * 2)
 
 
+_COMMON_UI_WORDS = frozenset({
+    "file", "edit", "view", "insert", "format", "tools", "window", "help",
+    "home", "settings", "options", "preferences", "about", "properties",
+    "close", "exit", "quit", "minimize", "maximize", "restore",
+    "ok", "cancel", "yes", "no", "apply", "save", "open", "new", "delete",
+    "remove", "add", "create", "update", "submit", "send", "reply",
+    "back", "next", "previous", "finish", "done", "retry", "refresh",
+    "undo", "redo", "cut", "copy", "paste", "select", "search", "find",
+    "replace", "print", "share", "export", "import", "download", "upload",
+    "dashboard", "profile", "account", "inbox", "notifications", "messages",
+    "contacts", "favorites", "bookmarks", "history", "recent", "popular",
+    "explore", "discover", "browse", "library", "archive",
+    "online", "offline", "busy", "away", "active", "inactive", "enabled",
+    "disabled", "loading", "processing", "connecting", "connected",
+    "error", "warning", "info", "success", "failed", "pending", "complete",
+    "play", "pause", "stop", "mute", "volume", "fullscreen",
+    "start", "desktop", "network", "wifi", "bluetooth", "battery",
+    "brightness", "sound", "display", "chats", "groups", "channels",
+    "calls", "stories", "typing", "delivered", "read", "seen", "pinned",
+    "archived", "starred", "muted", "blocked", "report", "unread", "draft",
+    "log", "sign", "login", "logout", "signup", "register", "reset",
+    "password", "username", "email", "phone", "address", "name",
+    "general", "advanced", "custom", "default", "more", "less", "zoom",
+    "page", "source", "console", "inspect", "developer", "extensions",
+    "toolbar", "menu", "tabs", "tab", "panel", "sidebar", "footer",
+    "header", "navigation", "breadcrumb",
+})
+
+
 def _looks_like_ui_label(text, block):
     """Detect short labels, controls, and toolbar fragments."""
     compact = re.sub(r"\s+", " ", text.strip())
@@ -232,6 +261,7 @@ def _looks_like_ui_label(text, block):
     token_count = len(compact.split())
     is_single_line = len(block.get("lines", [])) <= 1
 
+    # --- Exact pattern matches ---
     if re.match(r"^\d{1,2}:\d{2}$", compact):
         return True
     if re.match(r"^(https?://|www\.)", compact, re.IGNORECASE):
@@ -240,10 +270,42 @@ def _looks_like_ui_label(text, block):
         return True
     if compact.endswith(":") and token_count <= 3:
         return True
+
+    # Keyboard shortcuts (Ctrl+X, Alt+F4, etc.)
+    if re.match(r"^(Ctrl|Alt|Shift|Win|Cmd|Fn)[\+\-]", compact, re.IGNORECASE):
+        return True
+
+    # Breadcrumb / path separators (Home > Settings > …)
+    if re.search(r"\s[>›»/\\]\s", compact) and token_count <= 6:
+        return True
+
+    # Toggle labels:  "ON / OFF", "Yes / No"
+    if re.match(r"^(On|Off|Yes|No|True|False|Enabled|Disabled)$", compact, re.IGNORECASE):
+        return True
+
+    # CamelCase or SCREAMING_SNAKE identifiers (developer UI)
+    if re.match(r"^[A-Z][a-z]+(?:[A-Z][a-z]+){1,}$", compact) and token_count == 1:
+        return True
+    if re.match(r"^[A-Z_]{4,}$", compact):
+        return True
+
+    # --- Position & size heuristics ---
     if is_single_line and token_count <= 2 and len(compact) <= 10 and block["w"] < 220:
         return True
     if is_single_line and block["h"] < 28 and block["w"] > 420 and token_count <= 4:
         return True
+
+    # --- Vocabulary-based detection ---
+    # If all tokens are common UI words, this is almost certainly a label.
+    if token_count <= 3:
+        lower_tokens = [t.lower().rstrip(".:;,") for t in compact.split()]
+        if all(t in _COMMON_UI_WORDS for t in lower_tokens if t):
+            return True
+
+    # Single-word common UI term
+    if token_count == 1 and compact.lower().rstrip(".:;,") in _COMMON_UI_WORDS:
+        return True
+
     return False
 
 

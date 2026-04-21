@@ -9,8 +9,10 @@ Pipeline:
   5. Show translated messages in a docked companion panel
 """
 
+import atexit
 import logging
 import sys
+import threading
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -47,10 +49,21 @@ class TranslationWorker(QtCore.QThread):
         self._scratchpad = ScreenScratchpad()
         self._translator = Translator()
         self._last_emitted_signature = None
+        self._consecutive_unchanged = 0
 
     def run(self):
         """Main worker loop."""
         self._running = True
+
+        # Lower this thread's priority so it doesn't starve user apps
+        try:
+            import ctypes
+            BELOW_NORMAL = 0x00004000
+            handle = ctypes.windll.kernel32.GetCurrentThread()
+            ctypes.windll.kernel32.SetThreadPriority(handle, -1)  # THREAD_PRIORITY_BELOW_NORMAL
+        except Exception:
+            pass
+
         self.status_update.emit("Worker started - press Ctrl+Shift+T to capture")
 
         while self._running:
@@ -78,6 +91,7 @@ class TranslationWorker(QtCore.QThread):
     def toggle_continuous(self):
         """Toggle continuous capture mode."""
         self._continuous = not self._continuous
+        self._consecutive_unchanged = 0
         state = "ON" if self._continuous else "OFF"
         self.status_update.emit(f"Continuous capture: {state}")
         return self._continuous
@@ -87,8 +101,21 @@ class TranslationWorker(QtCore.QThread):
         return self._continuous
 
     def _sleep_until_next_capture(self):
-        """Sleep in small chunks so stop requests stay responsive."""
-        remaining_ms = int(max(0.1, float(config["capture_interval_sec"])) * 1000)
+        """Sleep in small chunks so stop requests stay responsive.
+
+        Uses adaptive backoff: if the screen hasn't changed for several
+        consecutive frames, increase the sleep interval to reduce CPU usage.
+        """
+        base_sec = float(config["capture_interval_sec"])
+        adaptive = config.get("adaptive_interval", True)
+        backoff_sec = float(config.get("adaptive_backoff_sec", 5.0))
+
+        if adaptive and self._consecutive_unchanged >= 3:
+            interval_sec = max(base_sec, backoff_sec)
+        else:
+            interval_sec = base_sec
+
+        remaining_ms = int(max(0.1, interval_sec) * 1000)
         while self._running and self._continuous and remaining_ms > 0:
             chunk = min(150, remaining_ms)
             self.msleep(chunk)
@@ -110,8 +137,10 @@ class TranslationWorker(QtCore.QThread):
         """Emit panel data only when it changes."""
         signature = self._entry_signature(entries)
         if self._continuous and signature == self._last_emitted_signature:
+            self._consecutive_unchanged += 1
             return
 
+        self._consecutive_unchanged = 0
         self._last_emitted_signature = signature
         self.translations_ready.emit(entries, info)
 
@@ -119,6 +148,7 @@ class TranslationWorker(QtCore.QThread):
         """Reset hidden decision memory after major context changes."""
         self._scratchpad.reset()
         self._last_emitted_signature = None
+        self._consecutive_unchanged = 0
 
     def _process_screenshot(self):
         """Full pipeline: capture -> OCR -> translate -> panel update."""
@@ -142,7 +172,7 @@ class TranslationWorker(QtCore.QThread):
             blocks = filter_blocks_by_quality(
                 blocks,
                 image_shape=image.shape,
-                min_quality=0.35,
+                min_quality=0.45,
                 max_blocks=15,
             )
             if not blocks:
@@ -210,11 +240,15 @@ class TranslationWorker(QtCore.QThread):
             self.status_update.emit(f"Error: {exc}")
 
     def stop(self):
-        """Stop the worker cleanly."""
+        """Stop the worker cleanly without blocking the GUI thread too long."""
         self._running = False
         self._continuous = False
         self.requestInterruption()
-        self.wait(3000)
+        # Wait briefly — if the thread is stuck in OCR, don't block forever
+        if not self.wait(1500):
+            logger.warning("Worker thread did not stop in time, terminating")
+            self.terminate()
+            self.wait(500)
 
 
 class MainApp(QtWidgets.QApplication):
@@ -232,6 +266,7 @@ class MainApp(QtWidgets.QApplication):
         self._worker = TranslationWorker()
         self._region_selector = None
         self._keyboard = None
+        self._shutting_down = False
 
         self._worker.translations_ready.connect(self._overlay.update_translation)
         self._worker.status_update.connect(self._on_status_update)
@@ -239,6 +274,10 @@ class MainApp(QtWidgets.QApplication):
         self._setup_tray()
         self._worker.start()
         self._register_hotkeys()
+
+        # Safety-net shutdown handlers
+        self.aboutToQuit.connect(self._cleanup)
+        atexit.register(self._cleanup_atexit)
 
         logger.info(f"Target language: {config['target_language']}")
         logger.info(f"Capture hotkey: {config['toggle_hotkey']}")
@@ -330,9 +369,9 @@ class MainApp(QtWidgets.QApplication):
         self._speed_group = QtWidgets.QActionGroup(self)
         for label, sec in [
             ("Fast (1s)", 1.0),
-            ("Normal (2s)", 2.0),
-            ("Slow (3s)", 3.0),
-            ("Very Slow (5s)", 5.0),
+            ("Normal (3s)", 3.0),
+            ("Slow (5s)", 5.0),
+            ("Very Slow (8s)", 8.0),
         ]:
             action = speed_menu.addAction(label)
             action.setCheckable(True)
@@ -340,6 +379,14 @@ class MainApp(QtWidgets.QApplication):
             action.setData(sec)
             action.triggered.connect(self._change_speed)
             self._speed_group.addAction(action)
+
+        menu.addSeparator()
+
+        # View mode toggle
+        self._compact_action = menu.addAction("Compact View")
+        self._compact_action.setCheckable(True)
+        self._compact_action.setChecked(config.get("overlay_compact_mode", True))
+        self._compact_action.triggered.connect(self._toggle_compact_mode)
 
         menu.addSeparator()
 
@@ -375,22 +422,49 @@ class MainApp(QtWidgets.QApplication):
             logger.warning(f"Hotkey registration failed: {exc}")
 
     def _cleanup_hotkeys(self):
-        """Unregister hotkeys so the process can terminate cleanly."""
+        """Unregister hotkeys on a separate thread with a timeout to avoid deadlock."""
         if self._keyboard is None:
             return
 
-        try:
-            self._keyboard.unhook_all_hotkeys()
-            self._keyboard.unhook_all()
-        except Exception as exc:
-            logger.debug(f"Hotkey cleanup issue: {exc}")
-        finally:
-            self._keyboard = None
+        kb = self._keyboard
+        self._keyboard = None
+
+        def _do_unhook():
+            try:
+                kb.unhook_all_hotkeys()
+                kb.unhook_all()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_do_unhook, daemon=True)
+        t.start()
+        t.join(timeout=1.0)
+
+    def _cleanup(self):
+        """Shared cleanup logic — safe to call multiple times."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+
+        logger.info("Running cleanup...")
+        self._cleanup_hotkeys()
+        self._worker.stop()
+
+    def _cleanup_atexit(self):
+        """Last-resort cleanup registered with atexit."""
+        if not self._shutting_down:
+            self._cleanup()
 
     def _trigger_capture(self):
         """Trigger a one-shot capture and show the panel."""
-        self._arrange_split_view()
+        self._remember_source_window()
+        self._overlay.show_panel()
         self._worker.request_capture()
+
+    def _remember_source_window(self):
+        """Record the current foreground app as the capture source."""
+        hwnd = self._get_foreground_app_hwnd()
+        self._worker.set_source_window(hwnd)
 
     def _toggle_continuous(self):
         """Toggle continuous capture mode."""
@@ -399,7 +473,7 @@ class MainApp(QtWidgets.QApplication):
         self._continuous_action.setText(f"Continuous Mode: {label}")
 
         if is_on:
-            self._arrange_split_view()
+            self._remember_source_window()
             self._overlay.show_panel()
             self._tray.showMessage(
                 "Continuous Mode ON",
@@ -414,13 +488,6 @@ class MainApp(QtWidgets.QApplication):
                 QtWidgets.QSystemTrayIcon.Information,
                 2000,
             )
-
-    def _arrange_split_view(self):
-        """Dock the panel right and try to keep the active app on the left."""
-        source_hwnd = self._get_foreground_app_hwnd()
-        self._worker.set_source_window(source_hwnd)
-        self._overlay.dock_right_half()
-        self._snap_foreground_window_left(source_hwnd)
 
     def _get_foreground_app_hwnd(self):
         """Return the current foreground app window, excluding the panel."""
@@ -438,31 +505,6 @@ class MainApp(QtWidgets.QApplication):
             logger.debug(f"Foreground window lookup skipped: {exc}")
             return None
 
-    def _snap_foreground_window_left(self, hwnd):
-        """Best-effort split layout using the selected source window."""
-        if not hwnd:
-            return
-
-        try:
-            import ctypes
-
-            user32 = ctypes.windll.user32
-            available = self.primaryScreen().availableGeometry()
-            panel_width = int(available.width() * float(config.get("overlay_width_ratio", 0.42)))
-            panel_width = min(int(available.width() * 0.6), max(int(available.width() * 0.25), panel_width))
-            source_width = max(320, available.width() - panel_width)
-
-            user32.MoveWindow(
-                hwnd,
-                available.x(),
-                available.y(),
-                source_width,
-                available.height(),
-                True,
-            )
-        except Exception as exc:
-            logger.debug(f"Split-view snap skipped: {exc}")
-
     def _change_target_language(self):
         action = self._lang_group.checkedAction()
         if action:
@@ -478,6 +520,14 @@ class MainApp(QtWidgets.QApplication):
             sec = action.data()
             config.set("capture_interval_sec", sec)
             logger.info(f"Capture interval: {sec}s")
+
+    def _toggle_compact_mode(self):
+        compact = self._compact_action.isChecked()
+        config.set("overlay_compact_mode", compact)
+        # Force re-render with new mode
+        if self._worker._last_emitted_signature:
+            self._worker._last_emitted_signature = None
+            self._worker.request_capture()
 
     def _select_region(self):
         self._region_selector = RegionSelector()
@@ -509,11 +559,11 @@ class MainApp(QtWidgets.QApplication):
 
     def _quit(self):
         logger.info("Shutting down...")
-        self._cleanup_hotkeys()
-        self._worker.stop()
+        self._cleanup()
         self._tray.hide()
         self._overlay.close()
-        self.quit()
+        # Deferred quit to let pending events flush
+        QtCore.QTimer.singleShot(100, self.quit)
 
 
 def main():

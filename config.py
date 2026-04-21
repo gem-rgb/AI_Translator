@@ -13,32 +13,43 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
 DEFAULTS = {
     # Capture settings
     "capture_mode": "clipboard",       # "ocr", "clipboard", "both"
-    "capture_interval_sec": 2.0,       # seconds between OCR captures
+    "capture_interval_sec": 3.0,       # seconds between OCR captures (was 2.0)
     "capture_region": None,            # [x, y, w, h] or None for full screen
     "monitor_index": 1,                # which monitor to capture
     "capture_active_window_only": True,  # prefer the selected/foreground app window
+    "capture_max_width": 1920,         # cap capture width to save CPU
 
     # OCR settings
+    "ocr_backend": "easyocr",          # "easyocr" (default) or "tesseract"
     "tesseract_path": r"C:\Program Files\Tesseract-OCR\tesseract.exe",
     "ocr_language": "eng",             # Tesseract language pack
+    "easyocr_gpu": False,              # CPU-only (no NVIDIA GPU)
+    "easyocr_languages": ["en"],       # EasyOCR language packs to load
+    "easyocr_max_width": 1280,         # cap resolution for CPU performance
 
     # Translation settings
     "target_language": "en",           # translate TO this language
     "translation_mode": "online",      # "online" or "offline"
     "cache_size": 256,                 # max cached translations
     "scratchpad_history": 8,           # frames of hidden screenshot memory
-    "scratchpad_min_score": 0.48,      # decision threshold for candidate selection
+    "scratchpad_min_score": 0.62,      # decision threshold (was 0.48)
     "scratchpad_track_ttl": 6,         # stale track eviction in frames
 
     # Overlay settings
     "overlay_font_size": 16,
-    "overlay_opacity": 0.85,
+    "overlay_opacity": 0.92,
     "overlay_position": [100, 100],    # [x, y] on screen
     "overlay_max_width": 600,
     "overlay_bg_color": [30, 30, 30],  # RGB
     "overlay_text_color": [255, 255, 255],  # RGB
-    "overlay_width_ratio": 0.42,       # docked translation panel width
+    "overlay_width_ratio": 0.22,       # compact panel width (was 0.42)
     "overlay_dock_right": True,        # snap translation panel to right side
+    "overlay_compact_mode": True,      # show only translated text, no debug info
+
+    # Performance
+    "low_cpu_mode": False,             # more aggressive throttling
+    "adaptive_interval": True,         # back off interval when no changes detected
+    "adaptive_backoff_sec": 5.0,       # interval when no changes detected
 
     # Hotkey
     "toggle_hotkey": "ctrl+shift+t",
@@ -46,9 +57,7 @@ DEFAULTS = {
     # General
     "auto_start": False,
     "minimize_to_tray": True,
-}
-
-
+}   
 class Config:
     """Manage application settings with JSON persistence."""
 

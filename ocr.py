@@ -1,21 +1,49 @@
 """
-ocr.py — Text extraction from screen captures using Tesseract OCR.
+ocr.py — Unified OCR interface with pluggable backends.
 
-Includes image preprocessing for better accuracy and text deduplication
-to avoid re-processing identical frames.
+Supports:
+  - EasyOCR  (default, 83 languages, better accuracy on screens)
+  - Tesseract (legacy fallback, lighter weight)
+
+Both backends produce identical output format so the rest of the pipeline
+is completely backend-agnostic.
 """
 
 import hashlib
+import logging
 import os
 
 import cv2
+import numpy as np
 import pytesseract
 
 from config import config
 
+logger = logging.getLogger(__name__)
 
-class OCREngine:
-    """Extract text from images using Tesseract with preprocessing."""
+
+def get_ocr_engine():
+    """Factory: return the configured OCR engine instance.
+
+    Checks ``config["ocr_backend"]`` — ``"easyocr"`` or ``"tesseract"``.
+    Falls back to Tesseract if EasyOCR is not installed.
+    """
+    backend = config.get("ocr_backend", "easyocr")
+
+    if backend == "easyocr":
+        try:
+            from ocr_easyocr import EasyOCREngine
+            logger.info("Using EasyOCR backend")
+            return EasyOCREngine()
+        except (ImportError, RuntimeError) as exc:
+            logger.warning(f"EasyOCR unavailable ({exc}), falling back to Tesseract")
+            return TesseractEngine()
+
+    return TesseractEngine()
+
+
+class TesseractEngine:
+    """Extract text from images using Tesseract (legacy backend)."""
 
     def __init__(self):
         self._last_hash = None
@@ -30,13 +58,22 @@ class OCREngine:
         if tess_path and os.path.exists(tess_path):
             pytesseract.pytesseract.tesseract_cmd = tess_path
 
+    def _cap_resolution(self, image):
+        """Downscale image if it exceeds the configured max width to save CPU."""
+        max_w = int(config.get("capture_max_width", 1920))
+        h, w = image.shape[:2]
+        if w <= max_w:
+            return image, 1.0
+        scale = max_w / w
+        new_w = max_w
+        new_h = int(h * scale)
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return resized, scale
+
     def _preprocess_with_scale(self, image):
         """Preprocess image and keep track of OCR scaling."""
-        # Grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # Upscale smaller captures for OCR, but remember the scale so we can
-        # map Tesseract boxes back onto the original screenshot accurately.
         h, w = gray.shape
         scale = 1.0
         if w < 900:
@@ -47,10 +84,9 @@ class OCREngine:
                 interpolation=cv2.INTER_CUBIC,
             )
 
-        # Denoise while preserving edges
-        denoised = cv2.bilateralFilter(gray, 9, 75, 75)
+        # Lightweight denoise
+        denoised = cv2.GaussianBlur(gray, (3, 3), 0)
 
-        # Adaptive thresholding for varied lighting
         binary = cv2.adaptiveThreshold(
             denoised, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -61,34 +97,12 @@ class OCREngine:
         return binary, scale
 
     def preprocess(self, image):
-        """Preprocess image for better OCR accuracy.
-
-        Pipeline:
-          1. Convert to grayscale
-          2. Resize (upscale small text)
-          3. Apply bilateral filter (denoise while keeping edges)
-          4. Adaptive threshold for binarization
-
-        Args:
-            image: numpy.ndarray in BGR format.
-
-        Returns:
-            numpy.ndarray: Preprocessed binary image.
-        """
+        """Preprocess image for better OCR accuracy."""
         processed, _ = self._preprocess_with_scale(image)
         return processed
 
     def extract_text(self, image, preprocess=True):
-        """Extract text from an image.
-
-        Args:
-            image: numpy.ndarray in BGR format.
-            preprocess: Whether to apply preprocessing pipeline.
-
-        Returns:
-            str: Extracted text, or empty string if image is unchanged.
-        """
-        # Check if image has changed (dedup)
+        """Extract text from an image."""
         img_hash = self._hash_image(image)
         if img_hash == self._last_hash:
             return self._last_text
@@ -98,25 +112,20 @@ class OCREngine:
         else:
             processed = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # Run Tesseract
         try:
             text = pytesseract.image_to_string(
                 processed,
                 lang=config["ocr_language"],
-                config="--psm 6"  # Assume uniform block of text
+                config="--psm 6"
             )
         except pytesseract.TesseractNotFoundError:
-            return "[ERROR] Tesseract not found. Install from: https://github.com/UB-Mannheim/tesseract/wiki"
+            return "[ERROR] Tesseract not found."
         except Exception as e:
             return f"[OCR Error] {e}"
 
-        # Clean up text
         text = self._clean_text(text)
-
-        # Cache result
         self._last_hash = img_hash
         self._last_text = text
-
         return text
 
     def extract_text_with_boxes(self, image):
@@ -125,11 +134,14 @@ class OCREngine:
         Returns:
             list[dict]: List of {text, x, y, w, h, conf} dicts.
         """
-        img_hash = self._hash_image(image)
+        capped_image, res_scale = self._cap_resolution(image)
+
+        img_hash = self._hash_image(capped_image)
         if img_hash == self._last_boxes_hash:
             return list(self._last_boxes)
 
-        processed, scale = self._preprocess_with_scale(image)
+        processed, ocr_scale = self._preprocess_with_scale(capped_image)
+        total_scale = ocr_scale
 
         try:
             data = pytesseract.image_to_data(
@@ -144,35 +156,41 @@ class OCREngine:
         results = []
         n = len(data["text"])
 
-        # Dynamic confidence threshold based on text characteristics
         for i in range(n):
             text = data["text"][i].strip()
             conf = self._parse_confidence(data["conf"][i])
 
             if not text:
                 continue
-
-            # Skip very low confidence results
             if conf < 30:
                 continue
 
-            # Apply stricter confidence for short text (likely noise)
             text_len = len(text)
             if text_len <= 2 and conf < 60:
                 continue
             elif text_len <= 4 and conf < 45:
                 continue
 
-            # Filter out common OCR noise patterns
             if self._is_likely_noise(text, conf):
                 continue
 
+            raw_x = int(round(data["left"][i] / total_scale))
+            raw_y = int(round(data["top"][i] / total_scale))
+            raw_w = int(round(data["width"][i] / total_scale))
+            raw_h = int(round(data["height"][i] / total_scale))
+
+            if res_scale != 1.0:
+                raw_x = int(round(raw_x / res_scale))
+                raw_y = int(round(raw_y / res_scale))
+                raw_w = int(round(raw_w / res_scale))
+                raw_h = int(round(raw_h / res_scale))
+
             results.append({
                 "text": text,
-                "x": int(round(data["left"][i] / scale)),
-                "y": int(round(data["top"][i] / scale)),
-                "w": int(round(data["width"][i] / scale)),
-                "h": int(round(data["height"][i] / scale)),
+                "x": raw_x,
+                "y": raw_y,
+                "w": raw_w,
+                "h": raw_h,
                 "conf": conf,
                 "ocr_block_id": (
                     data.get("block_num", [0])[i],
@@ -191,23 +209,18 @@ class OCREngine:
         return results
 
     def _is_likely_noise(self, text, confidence):
-        """Determine if OCR result is likely noise based on text patterns and confidence."""
-
-        # Single characters with low confidence are likely noise
+        """Determine if OCR result is likely noise."""
         if len(text) == 1 and confidence < 70:
             return True
 
-        # Text with mostly special characters
         special_char_ratio = sum(1 for c in text if not c.isalnum()) / len(text)
         if special_char_ratio > 0.7 and confidence < 60:
             return True
 
-        # Very short text with numbers and symbols mixed
         if len(text) <= 3 and any(c.isdigit() for c in text) and any(not c.isalnum() for c in text):
             return True
 
-        # Common OCR artifacts
-        noise_patterns = ['|', 'l', 'i', 'o', '0', 'O']  # Characters often confused
+        noise_patterns = ['|', 'l', 'i', 'o', '0', 'O']
         if all(c in noise_patterns for c in text) and confidence < 50:
             return True
 
@@ -224,22 +237,56 @@ class OCREngine:
     @staticmethod
     def _hash_image(image):
         """Fast perceptual hash of an image for dedup."""
-        # Downsample to tiny size for fast comparison
         small = cv2.resize(image, (16, 16))
         return hashlib.md5(small.tobytes()).hexdigest()
 
     @staticmethod
     def _clean_text(text):
-        """Clean OCR output: remove excessive whitespace and noise."""
+        """Clean OCR output."""
         lines = text.strip().split("\n")
-        # Remove empty lines and lines with only special chars
         cleaned = []
         for line in lines:
             line = line.strip()
-            # Skip lines that are just noise (single chars, symbols)
             if len(line) > 1 and any(c.isalnum() for c in line):
                 cleaned.append(line)
         return "\n".join(cleaned)
+
+
+# Default engine — created once on import via factory
+_default_engine = None
+
+
+def _get_default_engine():
+    global _default_engine
+    if _default_engine is None:
+        _default_engine = get_ocr_engine()
+    return _default_engine
+
+
+class OCREngine:
+    """Unified adapter that delegates to the configured backend.
+
+    This is the class that the rest of the codebase imports.
+    It transparently forwards calls to EasyOCR or Tesseract.
+    """
+
+    def __init__(self):
+        self._engine = get_ocr_engine()
+
+    def extract_text_with_boxes(self, image):
+        return self._engine.extract_text_with_boxes(image)
+
+    def extract_text(self, image, preprocess=True):
+        if hasattr(self._engine, "extract_text"):
+            return self._engine.extract_text(image, preprocess=preprocess)
+        # EasyOCR path — concatenate box texts
+        boxes = self._engine.extract_text_with_boxes(image)
+        return "\n".join(b["text"] for b in boxes)
+
+    def preprocess(self, image):
+        if hasattr(self._engine, "preprocess"):
+            return self._engine.preprocess(image)
+        return image
 
 
 # Module-level convenience instance

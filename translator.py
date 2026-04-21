@@ -32,6 +32,46 @@ TARGET_SCRIPT_FAMILY = {
     "hi": "devanagari",
 }
 
+# Comprehensive list of common English UI words/labels that should never be
+# treated as foreign text requiring translation.  Kept lowercase for fast
+# membership testing.
+_UI_WORD_BLACKLIST = frozenset({
+    # -- Window chrome & system --
+    "file", "edit", "view", "insert", "format", "tools", "window", "help",
+    "home", "settings", "options", "preferences", "about", "properties",
+    "close", "exit", "quit", "minimize", "maximize", "restore",
+    # -- Common buttons / actions --
+    "ok", "cancel", "yes", "no", "apply", "save", "open", "new", "delete",
+    "remove", "add", "create", "update", "submit", "send", "reply", "forward",
+    "back", "next", "previous", "finish", "done", "retry", "refresh", "reload",
+    "undo", "redo", "cut", "copy", "paste", "select", "search", "find",
+    "replace", "print", "share", "export", "import", "download", "upload",
+    # -- Navigation / tabs --
+    "dashboard", "profile", "account", "inbox", "notifications", "messages",
+    "contacts", "favorites", "bookmarks", "history", "recent", "popular",
+    "trending", "explore", "discover", "browse", "library", "archive",
+    # -- Status / labels --
+    "online", "offline", "busy", "away", "active", "inactive", "enabled",
+    "disabled", "on", "off", "loading", "processing", "connecting",
+    "connected", "disconnected", "error", "warning", "info", "success",
+    "failed", "pending", "complete", "completed", "progress", "status",
+    "type", "name", "date", "time", "size", "location", "description",
+    # -- Media / content --
+    "play", "pause", "stop", "mute", "unmute", "volume", "fullscreen",
+    "picture", "video", "audio", "image", "photo", "camera", "microphone",
+    # -- System tray / taskbar --
+    "start", "taskbar", "desktop", "recycle", "bin", "network", "wifi",
+    "bluetooth", "battery", "brightness", "sound", "display",
+    # -- Browser --
+    "tabs", "extensions", "incognito", "private", "bookmark", "address",
+    "toolbar", "menu", "more", "zoom", "page", "source", "console",
+    "inspect", "developer",
+    # -- Chat app UI (not chat content) --
+    "chats", "groups", "channels", "calls", "stories", "status",
+    "typing", "delivered", "read", "seen", "pinned", "archived", "starred",
+    "muted", "blocked", "report", "unread", "draft",
+})
+
 
 class TranslationCache:
     """LRU cache wrapper for translations keyed by (text, source, target)."""
@@ -146,6 +186,19 @@ class Translator:
         if len(words) == 1 and len(words[0]) <= 4 and words[0].isascii() and words[0].isupper():
             return False, "short_uppercase_label"
 
+        # --- Expanded UI word blacklist filter ---
+        # If the entire text (1-3 words) consists of common UI vocabulary,
+        # it is almost certainly a button, menu item, or label — not chat.
+        if len(words) <= 3:
+            lower_words = [w.lower().rstrip(".:;,") for w in words]
+            if all(w in _UI_WORD_BLACKLIST for w in lower_words if w):
+                return False, "ui_label_blacklist"
+
+        # Single-word text that is a known UI label
+        if len(words) == 1:
+            if words[0].lower().rstrip(".:;,") in _UI_WORD_BLACKLIST:
+                return False, "ui_single_word"
+
         # Filter text that's mostly numbers or symbols
         letter_chars = sum(1 for c in text if c.isalpha())
         alnum_chars = sum(1 for c in text if c.isalnum())
@@ -203,6 +256,15 @@ class Translator:
         # langdetect struggles on compact Arabic/Persian chat messages.
         if source_script != "latin" and source_script != target_script:
             return True, "auto", f"{source_script}_script"
+
+        # --- Short Latin-script guard ---
+        # For Latin-script text with fewer than 3 words, langdetect is very
+        # unreliable and almost always produces false positives on English UI
+        # text.  Skip translation for these — real chat messages are usually
+        # longer.
+        words = re.sub(r"\s+", " ", text.strip()).split()
+        if source_script == "latin" and len(words) < 3:
+            return False, "en", "short_latin_skip"
 
         lang = self.detect_language(text)
 

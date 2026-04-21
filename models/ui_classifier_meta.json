@@ -1,0 +1,29 @@
+{
+  "accuracy": 0.999,
+  "cv_accuracy_mean": 0.9994,
+  "cv_accuracy_std": 0.0009,
+  "n_train": 12007,
+  "n_test": 3002,
+  "feature_columns": [
+    "x_norm",
+    "y_norm",
+    "w_norm",
+    "h_norm",
+    "text_length",
+    "word_count",
+    "is_single_line",
+    "has_punctuation",
+    "letter_ratio"
+  ],
+  "feature_importances": {
+    "text_length": 0.32,
+    "word_count": 0.258,
+    "has_punctuation": 0.1414,
+    "is_single_line": 0.1375,
+    "h_norm": 0.0748,
+    "w_norm": 0.0568,
+    "y_norm": 0.0093,
+    "letter_ratio": 0.0014,
+    "x_norm": 0.0006
+  }
+}

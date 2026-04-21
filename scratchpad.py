@@ -9,11 +9,14 @@ learned model, but currently uses transparent heuristics.
 
 from collections import deque
 import hashlib
+import logging
 import re
 
 import cv2
 
 from config import config
+
+logger = logging.getLogger(__name__)
 
 
 TARGET_SCRIPT_FAMILY = {
@@ -239,15 +242,87 @@ class ScreenScratchpad:
                 count += 1
         return count
 
+    @staticmethod
+    def _chat_cluster_score(blocks, target, image_h):
+        """Score how strongly this block belongs to a vertical chat cluster.
+
+        Real chat messages form dense vertical stacks with consistent x-
+        alignment and regular spacing.  Isolated UI labels do not.
+        """
+        cluster_members = 0
+        spacing_deltas = []
+
+        for other in blocks:
+            if other is target:
+                continue
+
+            # Similar horizontal position (same chat lane)
+            x_delta = abs(other["center_x"] - target["center_x"])
+            lane_width = max(target["w"], other["w"]) * 0.65
+            if x_delta > lane_width:
+                continue
+
+            v_gap = abs(other["center_y"] - target["center_y"])
+            if 12 <= v_gap <= image_h * 0.30:
+                cluster_members += 1
+                spacing_deltas.append(v_gap)
+
+        if cluster_members < 2:
+            return 0.0
+
+        # Bonus for regular spacing (characteristic of chat message lists)
+        if len(spacing_deltas) >= 2:
+            spacing_deltas.sort()
+            median_gap = spacing_deltas[len(spacing_deltas) // 2]
+            regular_count = sum(
+                1 for d in spacing_deltas
+                if abs(d - median_gap) < median_gap * 0.5
+            )
+            regularity = regular_count / len(spacing_deltas)
+        else:
+            regularity = 0.5
+
+        # More cluster members + regular spacing = higher score
+        density_bonus = min(0.30, cluster_members * 0.08)
+        regularity_bonus = regularity * 0.12
+        return density_bonus + regularity_bonus
+
     def _select_blocks(self, blocks, focus_lanes, image_w, image_h):
         """Choose the blocks that look most like real foreign-language content."""
         target_script = TARGET_SCRIPT_FAMILY.get(config["target_language"], "latin")
         selected = []
-        min_score = float(config.get("scratchpad_min_score", 0.48))
+        min_score = float(config.get("scratchpad_min_score", 0.62))
 
-        for block in blocks:
+        # --- Trained classifier pre-filter ---
+        ml_predictions = None
+        try:
+            from ui_classifier import ui_classifier
+            if ui_classifier.available:
+                ml_predictions = ui_classifier.predict_batch(
+                    blocks, image_w, image_h
+                )
+                if ml_predictions:
+                    logger.debug(
+                        f"ML classifier: {sum(1 for p in ml_predictions if p['is_ui'])} UI, "
+                        f"{sum(1 for p in ml_predictions if not p['is_ui'])} content"
+                    )
+        except Exception as exc:
+            logger.debug(f"ML classifier unavailable: {exc}")
+
+        for idx, block in enumerate(blocks):
             score = block.get("quality_score", 0.0)
+
+            # --- Apply ML classifier prediction ---
+            if ml_predictions and idx < len(ml_predictions):
+                pred = ml_predictions[idx]
+                if pred and pred["confidence"] >= 0.80:
+                    if pred["is_ui"]:
+                        score -= 0.35  # strong UI penalty
+                    else:
+                        score += 0.15  # content bonus
+
             neighbor_count = self._neighbor_count(blocks, block, image_h)
+            cluster_bonus = self._chat_cluster_score(blocks, block, image_h)
             in_lane = any(
                 block["center_x"] >= lane_start and block["center_x"] <= lane_end
                 for lane_start, lane_end in focus_lanes
@@ -270,6 +345,9 @@ class ScreenScratchpad:
             elif block["line_count"] == 1:
                 score -= 0.08
 
+            # --- Chat cluster bonus ---
+            score += cluster_bonus
+
             if block["line_count"] >= 2:
                 score += 0.07
             elif block["char_count"] <= 5:
@@ -281,9 +359,22 @@ class ScreenScratchpad:
             if block["w"] >= max(160, int(image_w * 0.14)):
                 score += 0.04
 
-            if block["y_norm"] < 0.08:
+            # --- Aggressive screen-zone penalties ---
+            # Title bar / toolbar zone (top 10% of screen)
+            if block["y_norm"] < 0.10:
+                score -= 0.30
+            elif block["y_norm"] < 0.08:
                 score -= 0.04
 
+            # Status bar / taskbar zone (bottom 5%)
+            if block["y_norm"] + block["h_norm"] > 0.95:
+                score -= 0.20
+
+            # Far-left sidebar (narrow strips like nav panels)
+            if block["x_norm"] < 0.10 and block["w_norm"] < 0.18:
+                score -= 0.15
+
+            # Wide title/toolbar bars spanning most of the screen
             if block["y_norm"] < 0.12 and block["w_norm"] > 0.45 and block["h_norm"] < 0.07:
                 score -= 0.42
             elif block["y_norm"] < 0.16 and block["w_norm"] > 0.55 and block["h_norm"] < 0.09:
@@ -294,6 +385,13 @@ class ScreenScratchpad:
 
             if block["x_norm"] < 0.16 and block["w_norm"] < 0.22:
                 score -= 0.1
+
+            # --- Minimum word guard for Latin-script ---
+            # Short Latin text (< 3 words) is almost always UI, not chat.
+            if block["script_family"] == "latin" and block["char_count"] < 12:
+                word_count = len(block.get("compact_text", "").split())
+                if word_count < 3:
+                    score -= 0.18
 
             block["scratchpad_score"] = max(0.0, min(1.0, score))
 
