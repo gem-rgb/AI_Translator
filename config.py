@@ -16,6 +16,7 @@ DEFAULTS = {
     "capture_interval_sec": 2.0,       # seconds between OCR captures
     "capture_region": None,            # [x, y, w, h] or None for full screen
     "monitor_index": 1,                # which monitor to capture
+    "capture_active_window_only": True,  # prefer the selected/foreground app window
 
     # OCR settings
     "tesseract_path": r"C:\Program Files\Tesseract-OCR\tesseract.exe",
@@ -25,6 +26,9 @@ DEFAULTS = {
     "target_language": "en",           # translate TO this language
     "translation_mode": "online",      # "online" or "offline"
     "cache_size": 256,                 # max cached translations
+    "scratchpad_history": 8,           # frames of hidden screenshot memory
+    "scratchpad_min_score": 0.48,      # decision threshold for candidate selection
+    "scratchpad_track_ttl": 6,         # stale track eviction in frames
 
     # Overlay settings
     "overlay_font_size": 16,
@@ -33,6 +37,8 @@ DEFAULTS = {
     "overlay_max_width": 600,
     "overlay_bg_color": [30, 30, 30],  # RGB
     "overlay_text_color": [255, 255, 255],  # RGB
+    "overlay_width_ratio": 0.42,       # docked translation panel width
+    "overlay_dock_right": True,        # snap translation panel to right side
 
     # Hotkey
     "toggle_hotkey": "ctrl+shift+t",

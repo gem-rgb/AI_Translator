@@ -1,329 +1,421 @@
 """
-overlay.py — Image-based overlay for displaying translated screenshots.
+overlay.py - Companion panel for live translated text only.
 
-Shows the translated screenshot in a floating, resizable window.
-Non-English chat messages are painted over with their English translations
-directly on the captured image.
+This window is a normal dockable companion panel, not a screenshot overlay.
 """
 
-import sys
-import cv2
-import numpy as np
+import ctypes
 
-from PyQt5 import QtWidgets, QtCore, QtGui
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from config import config
 
 
 class TranslationOverlay(QtWidgets.QWidget):
-    """Floating window that displays the translated screenshot image."""
+    """Dockable companion panel that shows translated text only."""
 
-    # Signal to update image from non-GUI threads
-    image_signal = QtCore.pyqtSignal(object, object, str)  # translated_img, original_img, info
+    translations_signal = QtCore.pyqtSignal(object, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         self._drag_pos = None
-        self._resize_edge = None
-        self._is_visible = False
-        self._current_translated = None
-        self._current_original = None
-        self._show_original = False  # toggle between original/translated
+        self._entries = []
+        self._hidden_for_capture = False
+        self._capture_exclusion_applied = False
 
         self._setup_window()
         self._setup_ui()
-        self._setup_animations()
-
-        # Connect signal for thread-safe image updates
-        self.image_signal.connect(self._on_image_received)
+        self.translations_signal.connect(self._on_translations_received)
 
     def _setup_window(self):
-        """Configure window flags for overlay behavior."""
+        """Configure the panel as a normal minimizable window."""
         self.setWindowFlags(
-            QtCore.Qt.WindowStaysOnTopHint
+            QtCore.Qt.Window
             | QtCore.Qt.FramelessWindowHint
-            | QtCore.Qt.Tool
         )
-        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
-        self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
 
-        # Load saved position
-        pos = config.get("overlay_position", [100, 100])
-        self.move(pos[0], pos[1])
-        self.resize(700, 500)
-        self.setMinimumSize(300, 200)
+        if config.get("overlay_dock_right", True):
+            self.dock_right_half(save_position=False)
+        else:
+            pos = config.get("overlay_position", [100, 100])
+            self.move(pos[0], pos[1])
+            self.resize(640, 820)
+
+        self.setMinimumSize(360, 360)
 
     def _setup_ui(self):
-        """Build the overlay UI."""
+        """Build the translation panel UI."""
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Container with dark background
         self._container = QtWidgets.QFrame(self)
         self._container.setStyleSheet("""
             QFrame {
-                background-color: rgba(20, 20, 30, 240);
-                border-radius: 12px;
-                border: 1px solid rgba(0, 150, 255, 100);
+                background-color: #f5f7fa;
+                border: 1px solid #d6dde7;
+                border-radius: 14px;
             }
         """)
         container_layout = QtWidgets.QVBoxLayout(self._container)
-        container_layout.setContentsMargins(2, 2, 2, 2)
+        container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(0)
 
-        # ── Title bar ──
         title_bar = QtWidgets.QFrame(self._container)
-        title_bar.setFixedHeight(36)
+        title_bar.setFixedHeight(48)
         title_bar.setStyleSheet("""
             QFrame {
-                background-color: rgba(0, 120, 220, 180);
-                border-top-left-radius: 12px;
-                border-top-right-radius: 12px;
-                border-bottom-left-radius: 0px;
-                border-bottom-right-radius: 0px;
+                background-color: #16324f;
+                border-top-left-radius: 14px;
+                border-top-right-radius: 14px;
+                border-bottom-left-radius: 0;
+                border-bottom-right-radius: 0;
                 border: none;
             }
         """)
         title_layout = QtWidgets.QHBoxLayout(title_bar)
-        title_layout.setContentsMargins(12, 0, 8, 0)
+        title_layout.setContentsMargins(14, 0, 10, 0)
 
-        title_label = QtWidgets.QLabel("🌐 Translated Chat", title_bar)
+        title_label = QtWidgets.QLabel("Live Translation Panel", title_bar)
         title_label.setStyleSheet("""
             QLabel {
                 color: white;
-                font-size: 13px;
-                font-weight: bold;
-                font-family: 'Segoe UI', Arial;
-                border: none;
+                font-size: 14px;
+                font-weight: 700;
+                font-family: 'Segoe UI';
                 background: transparent;
             }
         """)
         title_layout.addWidget(title_label)
 
-        self._info_label = QtWidgets.QLabel("", title_bar)
+        self._info_label = QtWidgets.QLabel("Waiting for capture", title_bar)
         self._info_label.setStyleSheet("""
             QLabel {
-                color: rgba(255, 255, 255, 180);
+                color: rgba(255, 255, 255, 170);
                 font-size: 11px;
-                font-family: 'Segoe UI', Arial;
-                border: none;
+                font-family: 'Segoe UI';
                 background: transparent;
             }
         """)
         title_layout.addWidget(self._info_label)
         title_layout.addStretch()
 
-        # Toggle button (original / translated)
-        self._toggle_btn = QtWidgets.QPushButton("👁 Original", title_bar)
-        self._toggle_btn.setFixedSize(90, 26)
-        self._toggle_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self._toggle_btn.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(255, 255, 255, 30);
-                color: white;
-                border: 1px solid rgba(255,255,255,60);
-                border-radius: 4px;
-                font-size: 11px;
-                font-family: 'Segoe UI', Arial;
-                padding: 2px 8px;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 255, 255, 60);
-            }
-        """)
-        self._toggle_btn.clicked.connect(self._toggle_view)
-        title_layout.addWidget(self._toggle_btn)
+        dock_btn = QtWidgets.QPushButton("Dock Right", title_bar)
+        dock_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        dock_btn.setFixedHeight(28)
+        dock_btn.setStyleSheet(self._button_style())
+        dock_btn.clicked.connect(self.dock_right_half)
+        title_layout.addWidget(dock_btn)
 
-        # Close button
-        close_btn = QtWidgets.QPushButton("✕", title_bar)
-        close_btn.setFixedSize(26, 26)
-        close_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        close_btn.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(255, 60, 60, 100);
-                color: white;
-                border: none;
-                border-radius: 4px;
-                font-size: 14px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 60, 60, 200);
-            }
-        """)
-        close_btn.clicked.connect(self.fade_out)
-        title_layout.addWidget(close_btn)
+        minimize_btn = QtWidgets.QPushButton("Minimize", title_bar)
+        minimize_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        minimize_btn.setFixedHeight(28)
+        minimize_btn.setStyleSheet(self._button_style())
+        minimize_btn.clicked.connect(self.showMinimized)
+        title_layout.addWidget(minimize_btn)
+
+        hide_btn = QtWidgets.QPushButton("Hide", title_bar)
+        hide_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        hide_btn.setFixedHeight(28)
+        hide_btn.setStyleSheet(self._button_style(soft=True))
+        hide_btn.clicked.connect(self.hide)
+        title_layout.addWidget(hide_btn)
 
         container_layout.addWidget(title_bar)
 
-        # ── Image display area ──
+        self._summary_bar = QtWidgets.QLabel(
+            "Select a region or start continuous mode to watch translated chat here.",
+            self._container,
+        )
+        self._summary_bar.setWordWrap(True)
+        self._summary_bar.setContentsMargins(16, 12, 16, 12)
+        self._summary_bar.setStyleSheet("""
+            QLabel {
+                color: #35516d;
+                background-color: #e7f0fa;
+                border: none;
+                border-bottom: 1px solid #d6dde7;
+                font-size: 11px;
+                font-family: 'Segoe UI';
+            }
+        """)
+        container_layout.addWidget(self._summary_bar)
+
         self._scroll = QtWidgets.QScrollArea(self._container)
         self._scroll.setWidgetResizable(True)
         self._scroll.setStyleSheet("""
             QScrollArea {
                 border: none;
-                background-color: rgba(30, 30, 40, 255);
-                border-bottom-left-radius: 12px;
-                border-bottom-right-radius: 12px;
+                background: #f5f7fa;
             }
             QScrollBar:vertical {
-                background: rgba(40, 40, 50, 200);
                 width: 8px;
+                background: #edf2f7;
                 border-radius: 4px;
             }
             QScrollBar::handle:vertical {
-                background: rgba(0, 150, 255, 150);
+                background: #b7c6d8;
                 border-radius: 4px;
                 min-height: 30px;
             }
-            QScrollBar:horizontal {
-                background: rgba(40, 40, 50, 200);
-                height: 8px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:horizontal {
-                background: rgba(0, 150, 255, 150);
-                border-radius: 4px;
-                min-width: 30px;
-            }
         """)
 
-        self._image_label = QtWidgets.QLabel()
-        self._image_label.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
-        self._image_label.setStyleSheet("background: transparent; border: none;")
-        self._scroll.setWidget(self._image_label)
+        self._cards_widget = QtWidgets.QWidget()
+        self._cards_layout = QtWidgets.QVBoxLayout(self._cards_widget)
+        self._cards_layout.setContentsMargins(16, 16, 16, 16)
+        self._cards_layout.setSpacing(12)
 
+        self._cards_layout.addWidget(self._build_empty_state())
+        self._cards_layout.addStretch()
+
+        self._scroll.setWidget(self._cards_widget)
         container_layout.addWidget(self._scroll)
 
-        # ── Status bar ──
-        self._status_bar = QtWidgets.QLabel("Ready — Press Ctrl+Shift+T to capture", self._container)
-        self._status_bar.setFixedHeight(24)
+        self._status_bar = QtWidgets.QLabel(
+            "Ready",
+            self._container,
+        )
+        self._status_bar.setFixedHeight(28)
         self._status_bar.setStyleSheet("""
             QLabel {
-                color: rgba(255, 255, 255, 130);
-                font-size: 10px;
-                font-family: 'Segoe UI', Arial;
-                padding-left: 12px;
-                background-color: rgba(15, 15, 20, 200);
-                border-bottom-left-radius: 12px;
-                border-bottom-right-radius: 12px;
+                color: #50657d;
+                background-color: #eef3f7;
                 border: none;
+                border-top: 1px solid #d6dde7;
+                border-bottom-left-radius: 14px;
+                border-bottom-right-radius: 14px;
+                font-size: 11px;
+                font-family: 'Segoe UI';
+                padding-left: 14px;
             }
         """)
         container_layout.addWidget(self._status_bar)
 
         layout.addWidget(self._container)
 
-    def _setup_animations(self):
-        """Setup fade-in / fade-out animations."""
-        self._opacity_effect = QtWidgets.QGraphicsOpacityEffect(self)
-        self._opacity_effect.setOpacity(0.0)
-        self.setGraphicsEffect(self._opacity_effect)
+    @staticmethod
+    def _button_style(soft=False):
+        """Shared title-bar button styling."""
+        if soft:
+            bg = "rgba(255, 255, 255, 0.12)"
+            hover = "rgba(255, 255, 255, 0.22)"
+        else:
+            bg = "#2f6ea6"
+            hover = "#3e82bf"
 
-        self._fade_anim = QtCore.QPropertyAnimation(self._opacity_effect, b"opacity")
-        self._fade_anim.setDuration(300)
-        self._fade_anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
-
-    def update_translation(self, translated_img, original_img, info=""):
-        """Thread-safe method to update the displayed image.
-
-        Args:
-            translated_img: numpy BGR image with translations painted on.
-            original_img: numpy BGR original screenshot.
-            info: Status info string.
+        return f"""
+            QPushButton {{
+                background-color: {bg};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 11px;
+                font-family: 'Segoe UI';
+                font-weight: 600;
+                padding: 0 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {hover};
+            }}
         """
-        self.image_signal.emit(translated_img, original_img, info)
 
-    def _on_image_received(self, translated_img, original_img, info):
-        """Handle image update on the GUI thread."""
-        self._current_translated = translated_img
-        self._current_original = original_img
-        self._show_original = False
-        self._toggle_btn.setText("👁 Original")
+    def showEvent(self, event):
+        """Re-apply capture exclusion when the panel becomes visible."""
+        super().showEvent(event)
+        self._apply_capture_exclusion()
 
-        self._display_image(translated_img)
-        self._info_label.setText(info)
-        self._status_bar.setText(f"✅ {info}")
-
-        self.fade_in()
-
-    def _display_image(self, img):
-        """Display a numpy BGR image in the image label."""
-        if img is None:
+    def _apply_capture_exclusion(self):
+        """Best-effort request to exclude this panel from Windows capture."""
+        if self._capture_exclusion_applied:
             return
 
-        # Scale image to fit window width while maintaining aspect ratio
-        display_width = self.width() - 20  # padding
-        h, w = img.shape[:2]
-        scale = display_width / w if w > display_width else 1.0
-        if scale < 1.0:
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        try:
+            user32 = ctypes.windll.user32
+            WDA_EXCLUDEFROMCAPTURE = 0x11
+            user32.SetWindowDisplayAffinity(int(self.winId()), WDA_EXCLUDEFROMCAPTURE)
+            self._capture_exclusion_applied = True
+        except Exception:
+            self._capture_exclusion_applied = False
 
-        # Convert BGR to RGB
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        bytes_per_line = ch * w
+    def update_translation(self, entries, info=""):
+        """Thread-safe update for the panel contents."""
+        self.translations_signal.emit(entries, info)
 
-        qt_img = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
-        pixmap = QtGui.QPixmap.fromImage(qt_img)
-        self._image_label.setPixmap(pixmap)
-        self._image_label.adjustSize()
+    def _on_translations_received(self, entries, info):
+        """Render translated entries on the GUI thread."""
+        self._entries = entries or []
+        self._info_label.setText(info or "Updated")
 
-    def _toggle_view(self):
-        """Toggle between translated and original view."""
-        self._show_original = not self._show_original
-        if self._show_original and self._current_original is not None:
-            self._display_image(self._current_original)
-            self._toggle_btn.setText("🌐 Translated")
-            self._status_bar.setText("📷 Showing original — click to see translation")
-        elif self._current_translated is not None:
-            self._display_image(self._current_translated)
-            self._toggle_btn.setText("👁 Original")
-            self._status_bar.setText("✅ Showing translated view")
+        count = len(self._entries)
+        if count:
+            self._summary_bar.setText(
+                f"Showing {count} translated item{'s' if count != 1 else ''} from the current app view."
+            )
+        else:
+            self._summary_bar.setText(
+                "No foreign-language chat detected in the current app view."
+            )
+
+        self._rebuild_cards()
+        self._status_bar.setText(info or "Ready")
+        self.show_panel()
+
+    def _rebuild_cards(self):
+        """Rebuild the list of translated message cards."""
+        while self._cards_layout.count():
+            item = self._cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        if not self._entries:
+            self._cards_layout.addWidget(self._build_empty_state())
+            self._cards_layout.addStretch()
+            return
+
+        for index, entry in enumerate(self._entries, start=1):
+            self._cards_layout.addWidget(self._build_entry_card(index, entry))
+
+        self._cards_layout.addStretch()
+        self._scroll.verticalScrollBar().setValue(0)
+
+    def _build_empty_state(self):
+        """Create the placeholder shown when nothing is translated yet."""
+        empty_state = QtWidgets.QLabel(
+            "No translated messages yet.\n\nThe panel will show only the text that looks like real foreign-language chat content.",
+            self._cards_widget,
+        )
+        empty_state.setAlignment(QtCore.Qt.AlignCenter)
+        empty_state.setWordWrap(True)
+        empty_state.setStyleSheet("""
+            QLabel {
+                color: #60758f;
+                background: white;
+                border: 1px dashed #c7d3e0;
+                border-radius: 12px;
+                padding: 28px 18px;
+                font-size: 12px;
+                font-family: 'Segoe UI';
+            }
+        """)
+        return empty_state
+
+    def _build_entry_card(self, index, entry):
+        """Create one translated message card."""
+        frame = QtWidgets.QFrame(self._cards_widget)
+        frame.setStyleSheet("""
+            QFrame {
+                background: white;
+                border: 1px solid #dce4ee;
+                border-radius: 12px;
+            }
+        """)
+        layout = QtWidgets.QVBoxLayout(frame)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        meta = QtWidgets.QLabel(
+            f"Message {index:02d}  |  {entry.get('source_lang', 'auto').upper()} -> {entry.get('target_lang', 'EN').upper()}",
+            frame,
+        )
+        meta.setStyleSheet("""
+            QLabel {
+                color: #5d7087;
+                font-size: 10px;
+                font-weight: 700;
+                font-family: 'Segoe UI';
+                letter-spacing: 0.4px;
+                border: none;
+            }
+        """)
+        layout.addWidget(meta)
+
+        translated = QtWidgets.QLabel(entry.get("translated_text", ""), frame)
+        translated.setWordWrap(True)
+        translated.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        translated.setStyleSheet("""
+            QLabel {
+                color: #162636;
+                font-size: 14px;
+                font-weight: 600;
+                font-family: 'Segoe UI';
+                border: none;
+            }
+        """)
+        layout.addWidget(translated)
+
+        original_text = entry.get("original_text", "").strip()
+        if original_text:
+            original = QtWidgets.QLabel(original_text, frame)
+            original.setWordWrap(True)
+            original.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            original.setStyleSheet("""
+                QLabel {
+                    color: #6b7d91;
+                    font-size: 11px;
+                    font-family: 'Segoe UI';
+                    border: none;
+                }
+            """)
+            layout.addWidget(original)
+
+        return frame
 
     def set_status(self, text):
-        """Update status bar text (thread-safe via QMetaObject)."""
+        """Update the summary status quietly."""
         QtCore.QMetaObject.invokeMethod(
-            self._status_bar, "setText",
+            self._status_bar,
+            "setText",
             QtCore.Qt.QueuedConnection,
             QtCore.Q_ARG(str, text),
         )
 
-    def fade_in(self):
-        """Fade the overlay in."""
-        self._fade_anim.stop()
-        self._fade_anim.setStartValue(self._opacity_effect.opacity())
-        self._fade_anim.setEndValue(1.0)
-        self._fade_anim.start()
-        self.show()
-        self._is_visible = True
+    def show_panel(self):
+        """Show or restore the panel without an animation."""
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self._apply_capture_exclusion()
 
-    def fade_out(self):
-        """Fade the overlay out."""
-        self._fade_anim.stop()
-        self._fade_anim.setStartValue(self._opacity_effect.opacity())
-        self._fade_anim.setEndValue(0.0)
-        self._fade_anim.finished.connect(self._on_fade_out_done)
-        self._fade_anim.start()
-
-    def _on_fade_out_done(self):
-        """Hide window after fade out completes."""
-        try:
-            self._fade_anim.finished.disconnect(self._on_fade_out_done)
-        except TypeError:
-            pass
-        if self._opacity_effect.opacity() < 0.1:
+    def prepare_for_capture(self):
+        """Temporarily hide the panel from view if needed."""
+        if self.isVisible() and not self.isMinimized():
             self.hide()
-            self._is_visible = False
+            self._hidden_for_capture = True
 
-    # ── Dragging support (title bar area) ──
+    def restore_after_capture(self):
+        """Restore the panel after background capture completes."""
+        if self._hidden_for_capture:
+            self._hidden_for_capture = False
+            if self._entries:
+                self.show_panel()
+
+    def dock_right_half(self, save_position=True):
+        """Snap the panel to the right side of the primary screen."""
+        screen = QtWidgets.QApplication.primaryScreen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        width_ratio = float(config.get("overlay_width_ratio", 0.42))
+        width_ratio = min(0.6, max(0.25, width_ratio))
+        panel_width = int(available.width() * width_ratio)
+
+        self.setGeometry(
+            available.right() - panel_width + 1,
+            available.y(),
+            panel_width,
+            available.height(),
+        )
+
+        if save_position:
+            config.set("overlay_position", [self.x(), self.y()])
 
     def mousePressEvent(self, event):
-        if event.button() == QtCore.Qt.LeftButton and event.pos().y() < 40:
+        if event.button() == QtCore.Qt.LeftButton and event.pos().y() < 52:
             self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
             event.accept()
 
@@ -335,23 +427,14 @@ class TranslationOverlay(QtWidgets.QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton and self._drag_pos:
             self._drag_pos = None
-            pos = self.pos()
-            config.set("overlay_position", [pos.x(), pos.y()])
+            config.set("overlay_position", [self.x(), self.y()])
             event.accept()
-
-    def resizeEvent(self, event):
-        """Re-render image when window is resized."""
-        super().resizeEvent(event)
-        if self._show_original and self._current_original is not None:
-            self._display_image(self._current_original)
-        elif self._current_translated is not None:
-            self._display_image(self._current_translated)
 
 
 class RegionSelector(QtWidgets.QWidget):
     """Full-screen overlay for selecting a capture region via drag."""
 
-    region_selected = QtCore.pyqtSignal(int, int, int, int)  # x, y, w, h
+    region_selected = QtCore.pyqtSignal(int, int, int, int)
 
     def __init__(self):
         super().__init__()
@@ -383,11 +466,12 @@ class RegionSelector(QtWidgets.QWidget):
             painter.setPen(pen)
             painter.drawRect(rect)
 
-            w = rect.width()
-            h = rect.height()
             painter.setPen(QtGui.QColor(255, 255, 255))
             painter.setFont(QtGui.QFont("Segoe UI", 10))
-            painter.drawText(rect.topLeft() + QtCore.QPoint(4, -6), f"{w} × {h}")
+            painter.drawText(
+                rect.topLeft() + QtCore.QPoint(4, -6),
+                f"{rect.width()} x {rect.height()}",
+            )
 
     def mousePressEvent(self, event):
         self._origin = event.pos()
